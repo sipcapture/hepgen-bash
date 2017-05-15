@@ -23,4 +23,4 @@ sends a HEP3 log packet to **10.0.0.42:9060** with source capture id **1337**, *
 
 ## Limitations
 
-For now, `hep_send_log` script supports IPv4 as source or destination
+For now, `hep_send_log` only supports IPv4 as source or destination
