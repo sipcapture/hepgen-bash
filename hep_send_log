@@ -1,0 +1,180 @@
+#!/bin/bash
+
+# hep_send_log: sends a HEP log event with bash
+# Copyright (C) 2017 Orange
+# <camille.oudot@orange.com>
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public
+# License as published by the Free Software Foundation; either
+# version 2.1 of the License, or (at your option) any later version.
+#
+# This library is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public
+# License along with this library; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+
+function hep_send_log() {
+    local -i captid=0 usekey=0
+    local authkey srcip
+    local opt
+    local -r IP4_RE='(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?).(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?).(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?).(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)'
+    local -r PORT_RE='([0-9]{1,4}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])'
+
+    while getopts 'i:k:s:h' opt
+    do
+        case "$opt" in
+            i)
+                captid="$OPTARG"
+                if [[ ! "$OPTARG" =~ ^[1-9][0-9]*$ ]]
+                then
+                    printf 'not a valid decimal number: "%s"\n' "$OPTARG" >&2
+                    return 1
+                fi
+                ;;
+            h)
+                printf \
+'Sends a log message with the given correlation ID to the given destination, in a HEP3 packet.
+Usage:
+%s [OPTIONS] <DST IPV4>:<DST PORT> <CORRELATION ID> <MESSAGE>
+OPTIONS:
+  -i <ID>  : sets the HEP capture ID (default: 0)
+  -k <KEY> : sets the HEP auth key (default: none)
+  -s <IP4> : sets the HEP source IP (default: will use `ip route get` to guess)
+  -h       : displays this message and exits\n' \
+                    "$0"
+                return 0
+                ;;
+            k)
+                authkey="$OPTARG"
+                usekey=1
+                ;;
+            s)
+                if [[ ! "$OPTARG" =~ ^${IP4_RE}$ ]]
+                then
+                    printf 'invalid source IP: "%s"\n' "$OPTARG" >&2
+                    return 1
+                else
+                    srcip="$OPTARG"
+                fi
+                ;;
+            *)
+                return 1
+        esac
+    done
+
+    shift "$((OPTIND-1))"
+
+    if [[ $# -lt 3 ]]
+    then
+        printf 'not enough parameters\n\n' >&2
+        "$0" -h >&2
+        return 1
+    fi
+
+    if [[ ! "$1" =~ ^${IP4_RE}:${PORT_RE}$ ]]
+    then
+        printf 'not a valid <ipv4>:<port> "%s"\n' "$1" >&2
+        return 1
+    fi
+
+
+    local dstip=${1%:*}
+    local dstport=${1##*:}
+    local buf
+    # note: the %N date format is GNU-specific
+    local ts=$(date +%s:%6N)
+
+    if [[ "$srcip" == '' ]]
+    then
+        local l
+        srcip=$(ip route get to "$dstip" | { read l; printf %s "${l#* src }"; })
+    fi
+
+    # buf=
+    #   IPv4 family
+    #   UDP protocol ID
+    #   src addr
+    #   dst addr
+    #   fake src port (0)
+    #   dst port
+    #   seconds
+    #   micro seconds
+    #   protocol type: log
+    #   capture id
+    #   correlation id
+    #   message
+    #   [optionnaly] auth key
+    #
+    # note: ${xxxip//\./ } (no double-quoting) will expand as 4 tokens, this
+    # makes shellcheck cry but it is intended (to fit the "%02x%02x%02x%02x"
+    # format)
+    buf=00000001000702\
+00000002000711\
+00000003000a$(printf %02x%02x%02x%02x ${srcip//\./ })\
+00000004000a$(printf %02x%02x%02x%02x ${dstip//\./ })\
+0000000700080000\
+000000080008$(dec2hex x16 "$dstport")\
+00000009000a$(dec2hex x32 "${ts%:*}")\
+0000000a000a$(dec2hex x32 "${ts##*:}")\
+0000000b000764\
+0000000c000a$(dec2hex x32 "$captid")\
+00000011$(dec2hex x16 $((6 + ${#2})))$(printf %s "$2" | bin2hex)\
+0000000f$(dec2hex x16 $((6 + ${#3})))$(printf %s "$3" | bin2hex)
+
+    if [[ $usekey == 1 ]]
+    then
+        buf=$buf'0000000e'$(dec2hex x16 $((6 + ${#authkey})))$(printf %s "$authkey" | bin2hex)
+    fi
+
+    #  "HEP3"  + length (header (6) + buf size as binary data) + buf
+    <<<"48455033$(dec2hex x16 $((6 + ${#buf}/2)))$buf" hex2bin > "/dev/udp/$dstip/$dstport"
+}
+
+
+function hex2bin() {
+    xxd -r -p
+    return $?
+}
+
+
+function bin2hex() {
+    local l
+    #        (remove newlines)
+    xxd -p | while read l; do printf %s "$l"; done
+    return $?
+}
+
+
+function dec2hex() {
+    local cmd="$1"
+    local dec="${2#0}" # remove leading zeroes so it's not considered octal
+    local tmp=$(printf %08x "$dec")
+    case "$cmd" in
+        x8)
+            printf %s "${tmp: -2}"
+        ;;
+        x16|x16b)
+            printf %s "${tmp: -4}"
+        ;;
+        x16l)
+            printf %s%s "${tmp: -2}" "${tmp: -4:2}"
+        ;;
+        x32|x32b)
+            printf %s "${tmp: -8}"
+        ;;
+        x32l)
+            printf %s%s%s%s "${tmp: -2}" "${tmp: -4:2}" "${tmp: -6:2}" "${tmp: -8:2}"
+        ;;
+        *)
+            echo "unknown $0 command \"$cmd\"" >&2
+            return 1
+        ;;
+    esac
+}
+
+hep_send_log "$@"
